@@ -1,201 +1,264 @@
+import requests
+import pytz
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, CallbackContext
+import pymongo
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from dotenv import load_dotenv
 import os
 import logging
-import asyncio
-from typing import Dict, Any
-
-import pytz
-import requests
-import pymongo
-from dotenv import load_dotenv
-from flask import Flask, request, jsonify
-from aiohttp import ClientSession
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, 
-    CommandHandler, 
-    CallbackQueryHandler, 
-    ContextTypes
-)
+from datetime import datetime, date
+from apscheduler.schedulers.background import BackgroundScheduler
 import firebase_admin
 from firebase_admin import credentials, messaging
-from apscheduler.schedulers.background import BackgroundScheduler
-from pymongo import MongoClient
 
-# Enhanced Logging Configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('app.log')
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+MONGO_URI = os.getenv('MONGO_URI')
+DB_NAME = os.getenv('DB_NAME', 'Cluster0')
 
-# Configuration Class for Centralized Management
-class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    MONGO_URI = os.getenv('MONGO_URI')
-    DB_NAME = os.getenv('DB_NAME', 'Cluster0')
-    WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://your-domain.com/webhook')
-    PORT = int(os.getenv('PORT', 8080))
-    FIREBASE_CREDENTIALS_PATH = os.getenv('FIREBASE_CREDENTIALS_PATH')
+# MongoDB connection handling
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')  # Test connection
+    db = client[DB_NAME]
+    users_collection = db['users']
+    tasks_collection = db['tasks']
+    logs_collection = db['audit_logs']
+    logging.info(f"Successfully connected to MongoDB database: {DB_NAME}")
+except pymongo.errors.PyMongoError as e:
+    logging.critical(f"Failed to connect to MongoDB: {e}")
+    exit(1)
 
-# Enhanced MongoDB Connection with Robust Error Handling
-class DatabaseManager:
-    def __init__(self, uri: str, db_name: str):
-        try:
-            self.client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-            self.db = self.client[db_name]
-            self.users_collection = self.db['users']
-            self.tasks_collection = self.db['tasks']
-            self.logs_collection = self.db['audit_logs']
-            logger.info(f"Successfully connected to MongoDB database: {db_name}")
-        except pymongo.errors.PyMongoError as e:
-            logger.critical(f"Failed to connect to MongoDB: {e}")
-            raise
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# Firebase Notification Service
-class NotificationService:
-    def __init__(self, credentials_path: str):
-        try:
-            cred = credentials.Certificate(credentials_path)
-            firebase_admin.initialize_app(cred)
-        except Exception as e:
-            logger.error(f"Firebase initialization error: {e}")
+# Ensure Telegram Bot Token is provided
+if not TELEGRAM_BOT_TOKEN:
+    logging.critical("No Telegram Bot Token found. Please check your .env file.")
+    exit(1)
 
-    def send_push_notification(self, token: str, title: str, body: str):
-        try:
-            message = messaging.Message(
-                notification=messaging.Notification(title=title, body=body),
-                token=token
-            )
-            response = messaging.send(message)
-            logger.info(f"Push notification sent: {response}")
-        except Exception as e:
-            logger.error(f"Notification sending error: {e}")
+# Define UTC timezone
+utc = pytz.UTC
 
-# Enhanced Wallet Connect Integration
-class WalletConnectService:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db = db_manager
+# Helper function: Check if user has joined the required channel
+async def has_joined_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id="@simplco", user_id=user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        logging.warning(f"Error checking channel membership for user {user_id}: {e}")
+        return False
 
-    async def connect_wallet(self, user_id: int, wallet_address: str):
-        try:
-            # Validate wallet address (basic check)
-            if not self._validate_wallet_address(wallet_address):
-                return {"error": "Invalid wallet address"}
+# Updated start command
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    username = update.effective_user.username or f"User_{user_id}"
 
-            # Update user record with wallet
-            result = self.db.users_collection.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "wallet_address": wallet_address,
-                    "wallet_verified": True
-                }}
-            )
+    # Ensure the user joins the required channel
+    if not await has_joined_channel(context, user_id):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Please join @simplco to access all bot features!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Join Channel", url="https://t.me/simplco")]
+            ])
+        )
+        return
 
-            if result.modified_count:
-                return {"status": "Wallet connected successfully"}
-            return {"error": "Could not update wallet"}
+    # Initialize user record if not exists
+    user_record = users_collection.find_one({"user_id": user_id})
+    if not user_record:
+        users_collection.insert_one({
+            "user_id": user_id,
+            "username": username,
+            "balance": 0,
+            "wallet": 0,
+            "rank": None,
+            "joined_channel": True,
+            "last_claimed": None,
+            "tasks_completed": []
+        })
+        logging.info(f"New user registered: {username} (ID: {user_id})")
+    else:
+        users_collection.update_one({"user_id": user_id}, {"$set": {"joined_channel": True}})
 
-        except Exception as e:
-            logger.error(f"Wallet connection error: {e}")
-            return {"error": "Wallet connection failed"}
+    # Send main menu
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Launch Mini App", url="t.me/SimplQ_bot/rebltasks")],
+        [InlineKeyboardButton("Invite Friends", callback_data='invite_friends')],
+        [InlineKeyboardButton("Leaderboard", callback_data='leaderboard')],
+        [InlineKeyboardButton("Balance", callback_data='balance')],
+        [InlineKeyboardButton("Daily Rewards", callback_data='daily_rewards')],
+        [InlineKeyboardButton("Wallet", callback_data='wallet')],
+        [InlineKeyboardButton("Ranking", callback_data='ranking')]
+    ])
 
-    def _validate_wallet_address(self, address: str) -> bool:
-        # Basic wallet address validation
-        return (address.startswith('0x') and 
-                len(address) == 42 and 
-                all(c in '0123456789ABCDEFabcdef' for c in address[2:]))
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Welcome to the bot! Choose an option:",
+        reply_markup=reply_markup
+    )
 
-# Flask Application Setup
-def create_flask_app(
-    config: Config, 
-    db_manager: DatabaseManager, 
-    notification_service: NotificationService,
-    wallet_connect_service: WalletConnectService
-):
-    app = Flask(__name__)
-
-    @app.route('/webhook', methods=['POST'])
-    async def webhook():
-        # Telegram webhook handling
-        data = request.json
-        # Process webhook data...
-        return jsonify({"status": "success"}), 200
-
-    @app.route('/wallet/connect', methods=['POST'])
-    async def connect_wallet():
-        data = request.json
-        user_id = data.get('user_id')
-        wallet_address = data.get('wallet_address')
-        
-        result = await wallet_connect_service.connect_wallet(user_id, wallet_address)
-        return jsonify(result), 200 if 'status' in result else 400
-
-    # Additional routes...
-    return app
-
-# Telegram Bot Setup
-async def setup_telegram_bot(
-    config: Config, 
-    db_manager: DatabaseManager, 
-    notification_service: NotificationService
-):
-    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Configure webhook
-    await application.bot.set_webhook(url=config.WEBHOOK_URL)
-    
-    return application
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Existing start logic
-    await update.message.reply_text("Welcome to ReblTasks!")
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Callback query handling
+# Inline Button Handler
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    # Implement callback logic
 
-# Main Application Orchestrator
-async def main():
-    config = Config()
-    
-    # Initialize services
-    db_manager = DatabaseManager(config.MONGO_URI, config.DB_NAME)
-    notification_service = NotificationService(config.FIREBASE_CREDENTIALS_PATH)
-    wallet_connect_service = WalletConnectService(db_manager)
-    
-    # Create Flask app
-    flask_app = create_flask_app(
-        config, 
-        db_manager, 
-        notification_service, 
-        wallet_connect_service
+    handler_mapping = {
+        'invite_friends': invite_friends,
+        'leaderboard': leaderboard,
+        'balance': balance,
+        'wallet': wallet,
+        'ranking': ranking,
+        'daily_rewards': daily_rewards
+    }
+
+    handler = handler_mapping.get(query.data)
+    if handler:
+        await handler(update, context)
+    else:
+        fallback_message = "Unknown action. Please choose a valid option from the menu."
+        logging.error(f"Unknown callback query: {query.data}")
+        await query.message.reply_text(fallback_message)
+
+# Balance Handler
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.callback_query.from_user.id
+
+    # Fetch user data from MongoDB
+    user = users_collection.find_one({"user_id": user_id})
+    if user:
+        balance = user.get("balance", 0)
+        await update.callback_query.message.reply_text(f"Your current balance is {balance} $REBLCOINS.")
+    else:
+        await update.callback_query.message.reply_text("No user record found. Please register using /start.")
+
+# Invite Friends Handler
+async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.callback_query.from_user
+    referral_id = user.username if user.username else str(user.id)
+    referral_link = f"https://t.me/SimplQ_bot?start={referral_id}"
+    await update.callback_query.message.reply_text(f"Share this link with your friends: {referral_link}")
+
+# Leaderboard Handler
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        top_users = users_collection.find().sort("balance", pymongo.DESCENDING).limit(10)
+        leaderboard_text = "🏆 Leaderboard 🏆\n\n"
+        for i, user in enumerate(top_users, 1):
+            username = user.get('username', 'Anonymous')
+            leaderboard_text += f"{i}. {username}: {user.get('balance', 0)} $REBLCOINS\n"
+        await update.callback_query.message.reply_text(leaderboard_text)
+    except Exception as e:
+        logging.error(f"Error retrieving leaderboard: {e}")
+        await update.callback_query.message.reply_text("Error retrieving leaderboard data.")
+
+# Daily Rewards Handler
+async def daily_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.callback_query.from_user.id
+    today = utc.localize(datetime.combine(date.today(), datetime.min.time()))
+
+    user = users_collection.find_one({"user_id": user_id})
+    if not user:
+        await update.callback_query.message.reply_text("No user record found. Please register using /start.")
+        return
+
+    last_claimed = user.get("last_claimed")
+    if last_claimed:
+        last_claimed = utc.localize(last_claimed) if not last_claimed.tzinfo else last_claimed
+        if last_claimed.date() == today.date():
+            await update.callback_query.message.reply_text("You've already claimed your daily reward today.")
+            return
+
+    users_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"balance": user.get("balance", 0) + 10, "last_claimed": today}}
     )
-    
-    # Setup Telegram bot
-    telegram_bot = await setup_telegram_bot(
-        config, 
-        db_manager, 
-        notification_service
+    await update.callback_query.message.reply_text("You have successfully claimed 10 $REBLCOINS!")
+
+# Ranking Handler (Optimized for scalability)
+async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.callback_query.from_user.id
+    user_rank = list(users_collection.aggregate([
+        {"$setWindowFields": {
+            "partitionBy": None,
+            "sortBy": {"balance": -1},
+            "output": {
+                "rank": {"$rank": {}}
+            }
+        }},
+        {"$match": {"user_id": user_id}}
+    ]))
+
+    if user_rank:
+        user = user_rank[0]
+        rank = user.get("rank")
+        balance = user.get("balance", 0)
+        await update.callback_query.message.reply_text(f"Your rank: {rank}\nYour balance: {balance} $REBLCOINS.")
+    else:
+        await update.callback_query.message.reply_text("No user record found. Please register using /start.")
+
+# Wallet Handler
+async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.callback_query.from_user.id
+
+    # Fetch user data
+    user = users_collection.find_one({"user_id": user_id})
+    if user:
+        wallet = user.get("wallet", 0)
+        balance = user.get("balance", 0)
+        await update.callback_query.message.reply_text(f"Your wallet: {wallet}\nYour balance: {balance} $REBLCOINS.")
+    else:
+        await update.callback_query.message.reply_text("No user record found. Please register using /start.")
+
+# Send push notification
+def send_push_notification(token, title, body):
+    """Send a push notification."""
+    # Initialize Firebase Admin SDK
+    cred = credentials.Certificate('/Users/mac/Documents/WORKSPACE/untitled folder/journal/private keys/firebase/rebltasks-d156e-c10cc3a3732e.json')
+    firebase_admin.initialize_app(cred)
+
+    # Create the message
+    message = messaging.Message(
+        notification=messaging.Notification(
+            title=title,
+            body=body
+        ),
+        token=token  # User's device token
     )
+
+    # Send the message
+    response = messaging.send(message)
+    print(f"Push notification sent: {response}")
+
+# Scheduled Tasks
+def daily_reminder():
+    """Send daily reminders to all users."""
+    users = users_collection.find()
+    for user in users:
+        send_push_notification(user.get("device_token"), "Reminder", "Claim your daily reward!")
+
+# Set up scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_reminder, 'interval', days=1)
+scheduler.start()
+
+# Telegram Bot Setup
+def main():
+    # Telegram Bot application setup
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Run application
-    logger.info("Application started successfully")
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+    
+    # Start the bot
+    application.run_polling()
 
-if __name__ == '__main__':
-    asyncio.run(main())
-
-
-
+if __name__ == "__main__":
+    main()
