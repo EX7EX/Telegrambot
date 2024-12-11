@@ -1,21 +1,28 @@
-name: Telegram Bot Deployment
+name: Run Telegram Bot
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
-  deploy:
-    runs-on: ubuntu-22.04  # Explicitly set to Ubuntu 22.04
+  run-bot:
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.9'
-    
-   
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Run Bot
+        run: |
+          while true; do
+            python simplrefq.py
+            echo "Bot crashed. Restarting in 5 seconds..."
+            sleep 5
+          done
