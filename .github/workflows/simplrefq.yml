@@ -18,23 +18,35 @@ jobs:
       with:
         python-version: 3.12.6
 
-    
-        - name: Install dependencies
-        run: |
-          pip install requests pytz python-telegram-bot pymongo python-dotenv apscheduler firebase-admin
-
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pytz python-telegram-bot pymongo python-dotenv apscheduler firebase-admin
 
     - name: Load .env Variables
       run: echo "MONGO_URI=${{ secrets.MONGO_URI }}" >> $GITHUB_ENV
 
-      - name: Test MongoDB Connection
-  run: mongo --eval "db.stats()"
-
+    - name: Test MongoDB Connection
+      env:
+        MONGO_URI: ${{ secrets.MONGO_URI }}
+      run: |
+        echo "Testing MongoDB connection..."
+        python -c "
+import os
+from pymongo import MongoClient
+uri = os.getenv('MONGO_URI')
+if not uri:
+    raise ValueError('MONGO_URI is not set')
+client = MongoClient(uri)
+client.admin.command('ping')
+print('MongoDB connection successful!')
+        "
 
     - name: Run Telegram Bot
       env:
         MONGO_URI: ${{ secrets.MONGO_URI }}
       run: |
+        echo "Starting Telegram bot..."
         while true; do
           python simplrefq.py
         done
