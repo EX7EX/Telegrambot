@@ -1,0 +1,14 @@
+# Requirements for deployment
+Requirements (requirements.txt):
+python-telegram-bot==20.x
+Flask==2.x
+pymongo==4.x
+firebase-admin==5.x
+pytz==2023.x
+aiohttp==3.x
+APScheduler==3.x
+requests==2.x
+pyTelegramBotAPI
+python-dotenv
+pymongo
+telebot

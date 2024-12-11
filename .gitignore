@@ -1,0 +1,15 @@
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+*.env
+
+# Virtual environments
+venv/
+env/
+
+# Misc
+.DS_Store
